@@ -9,7 +9,7 @@ import zlib
 import zstandard
 import random
 import time
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, quote_plus, parse_qs
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, FormData
 from aiohttp_socks import ProxyConnector
@@ -627,6 +627,11 @@ class DLHDExtractor:
                         logger.info(
                             f"⏳ Using cached standard stream (LoveCDN cooldown active for {int(120 - (current_time - last_fail))}s)"
                         )
+                elif cached_data.get("_source") == "lovecdn" and not expires_at:
+                    logger.warning(
+                        f"⚠️ LoveCDN cache for {channel_id} has no expiry timestamp. Invalidating legacy cache entry."
+                    )
+                    is_valid = False
                 else:
                     # ✅ Only validate with HEAD request if we're within 5 minutes of expiry
                     # This reduces unnecessary network requests for fresh cache entries
