@@ -1,13 +1,11 @@
 import logging
 import re
-import random
 import time
 import asyncio
 from urllib.parse import urlparse
 from typing import Dict, Any
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
-from aiohttp_socks import ProxyConnector
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 logger = logging.getLogger(__name__)
@@ -54,9 +52,6 @@ class DLStreamsExtractor:
     def _clear_browser_failure(self, channel_key: str) -> None:
         self._browser_failure_cache.pop(channel_key, None)
 
-    def _get_random_proxy(self):
-        return random.choice(self.proxies) if self.proxies else None
-
     def _get_header(self, name: str, default: str | None = None) -> str | None:
         for key, value in self.request_headers.items():
             if key.lower() == name.lower():
@@ -82,11 +77,21 @@ class DLStreamsExtractor:
             channel_id = channel_id.replace("premium", "")
         return channel_id
 
+    def _build_player_urls(self, channel_id: str) -> list[str]:
+        origin = self.entry_origin.rstrip("/")
+        return [
+            f"{origin}/stream/stream-{channel_id}.php",
+            f"{origin}/cast/stream-{channel_id}.php",
+            f"{origin}/watch/stream-{channel_id}.php",
+            f"{origin}/plus/stream-{channel_id}.php",
+            f"{origin}/casting/stream-{channel_id}.php",
+            f"{origin}/player/stream-{channel_id}.php",
+        ]
+
     async def _prime_dlstreams_session(
         self,
         session: ClientSession,
-        watch_url: str,
-        channel_id: str,
+        player_url: str,
     ) -> None:
         warmup_headers = {
             "User-Agent": self.base_headers["User-Agent"],
@@ -97,20 +102,14 @@ class DLStreamsExtractor:
         if source_referer:
             warmup_headers["Referer"] = source_referer
 
-        warmup_urls = [
-            watch_url,
-            f"{self.entry_origin}/stream/stream-{channel_id}.php",
-        ]
+        try:
+            async with session.get(player_url, headers=warmup_headers) as resp:
+                await resp.read()
+            warmup_headers["Referer"] = player_url
+        except Exception as exc:
+            logger.debug("DLStreams warm-up failed for %s: %s", player_url, exc)
 
-        for warmup_url in warmup_urls:
-            try:
-                async with session.get(warmup_url, headers=warmup_headers) as resp:
-                    await resp.read()
-                warmup_headers["Referer"] = warmup_url
-            except Exception as exc:
-                logger.debug("DLStreams warm-up failed for %s: %s", warmup_url, exc)
-
-    async def _browser_prime_verification(self, watch_url: str, channel_key: str) -> bool:
+    async def _browser_prime_verification(self, player_url: str, channel_key: str) -> bool:
         cached_until = self._verified_channels.get(channel_key, 0)
         now = time.time()
         if cached_until > now:
@@ -143,7 +142,7 @@ class DLStreamsExtractor:
                         verify_seen = True
 
                 page.on("response", on_response)
-                await page.goto(watch_url, wait_until="domcontentloaded", timeout=20000)
+                await page.goto(player_url, wait_until="domcontentloaded", timeout=20000)
 
                 deadline = time.time() + 20
                 while time.time() < deadline and not verify_seen:
@@ -180,7 +179,7 @@ class DLStreamsExtractor:
             return cached[0]
 
         channel_key = f"premium{channel_id}"
-        watch_url = f"{self.entry_origin}/watch.php?id={channel_id}"
+        player_url = self._build_player_urls(channel_id)[0]
         if self._is_browser_cooldown_active(channel_key):
             logger.info("DLStreams browser key fetch skipped during cooldown for %s", channel_key)
             return None
@@ -214,7 +213,7 @@ class DLStreamsExtractor:
                         logger.debug("DLStreams browser response hook failed for %s: %s", response.url, exc)
 
                 page.on("response", on_response)
-                await page.goto(watch_url, wait_until="domcontentloaded", timeout=30000)
+                await page.goto(player_url, wait_until="domcontentloaded", timeout=30000)
 
                 deadline = time.time() + 20
                 while time.time() < deadline and key_bytes is None:
@@ -252,7 +251,7 @@ class DLStreamsExtractor:
             return cached[0]
         return None
 
-    async def _capture_browser_session_state(self, channel_id: str) -> None:
+    async def _capture_browser_session_state(self, channel_id: str, player_url: str | None = None) -> None:
         channel_key = f"premium{channel_id}"
         now = time.time()
         cached_manifest = self._browser_manifest_cache.get(channel_key)
@@ -272,7 +271,7 @@ class DLStreamsExtractor:
                 logger.info("DLStreams browser session capture skipped during cooldown for %s", channel_key)
                 return
 
-            watch_url = f"{self.entry_origin}/watch.php?id={channel_id}"
+            resolved_player_url = player_url or self._build_player_urls(channel_id)[0]
             logger.info("DLStreams browser session capture starting for %s", channel_key)
             try:
                 async with async_playwright() as playwright:
@@ -316,7 +315,7 @@ class DLStreamsExtractor:
                             logger.debug("DLStreams browser capture hook failed for %s: %s", response.url, exc)
 
                     context.on("response", on_response)
-                    await page.goto(watch_url, wait_until="domcontentloaded", timeout=30000)
+                    await page.goto(resolved_player_url, wait_until="domcontentloaded", timeout=30000)
 
                     deadline = time.time() + 20
                     while time.time() < deadline:
@@ -370,38 +369,37 @@ class DLStreamsExtractor:
 
             channel_key = f"premium{channel_id}"
             session = await self._get_session()
-            watch_url = f"{self.entry_origin}/watch.php?id={channel_id}"
+            player_urls = self._build_player_urls(channel_id)
+            for candidate in player_urls:
+                await self._prime_dlstreams_session(session, candidate)
+                await self._browser_prime_verification(candidate, channel_key)
+                await self._capture_browser_session_state(channel_id, candidate)
+                cached_manifest = self._browser_manifest_cache.get(channel_key)
+                if cached_manifest and cached_manifest[1] > time.time():
+                    break
 
-            await self._prime_dlstreams_session(session, watch_url, channel_id)
-            await self._browser_prime_verification(watch_url, channel_key)
             captured_manifest = await self.get_manifest_via_browser(url)
-
-            # --- SPEED BYPASS ---
-            # Current iframe host (user can update this manually here)
-            iframe_host = "embedkclx.sbs"
-            iframe_origin = f"https://{iframe_host}"
+            iframe_origin = self.entry_origin.rstrip("/")
 
             # 1. SERVER LOOKUP: Fetch dynamic server_key
             lookup_url = f"https://sec.ai-hls.site/server_lookup?channel_id={channel_key}"
             logger.info(f"Looking up server key for: {channel_key} (Bypassing {self.entry_origin})")
             
+            server_key = "wind"
             lookup_headers = {
                 "Referer": f"{iframe_origin}/",
-                "User-Agent": self.base_headers["User-Agent"]
+                "User-Agent": self.base_headers["User-Agent"],
             }
-            
             try:
                 async with session.get(lookup_url, headers=lookup_headers) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         server_key = data.get("server_key", "wind")
-                        logger.info(f"Found server_key: {server_key}")
+                        logger.info(f"Found server_key: {server_key} via {iframe_origin}")
                     else:
-                        logger.warning(f"Lookup failed (HTTP {resp.status}), using default key.")
-                        server_key = "wind"
+                        logger.debug("DLStreams lookup failed for %s with HTTP %s", iframe_origin, resp.status)
             except Exception as e:
-                logger.warning(f"Error during lookup: {e}, using default key.")
-                server_key = "wind"
+                logger.debug("DLStreams lookup error for %s: %s", iframe_origin, e)
 
             # 2. Construct M3U8 URL
             m3u8_url = f"https://sec.ai-hls.site/proxy/{server_key}/{channel_key}/mono.css"
