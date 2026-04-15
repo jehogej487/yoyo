@@ -161,234 +161,97 @@ class MaxstreamExtractor:
         
         raise ExtractorError(f"Connection failed for {url} after trying all paths. Last error: {last_error}")
 
-    async def _get_uprot_playwright(self, link: str) -> str:
-        """Use Playwright (real browser) to bypass Cloudflare on uprot.net."""
-        from playwright.async_api import async_playwright
-        from urllib.parse import urlparse
-        
-        parsed = urlparse(link)
-        domain = parsed.netloc
-        
-        # Resolve real IPs via DoH to bypass local DNS hijacking
-        real_ips = await self._resolve_doh(domain)
-        if not real_ips:
-            raise ExtractorError(f"DoH failed to resolve {domain}")
-        
-        # Try each resolved IP
-        last_error = None
-        for ip in real_ips[:3]:
-            chrome_args = [
-                "--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu",
-                "--disable-dev-shm-usage",
-                # Anti-detection
-                "--disable-blink-features=AutomationControlled",
-                f"--host-resolver-rules=MAP {domain} {ip}",
-            ]
-            logger.info(f"Playwright: trying {domain} -> {ip}")
+    def _parse_uprot_html(self, text: str) -> str:
+        """Parse uprot HTML to extract redirect link."""
+        # 1. Look for direct links in text (including escaped slashes)
+        match = re.search(r'https?://(?:www\.)?(?:stayonline\.pro|maxstream\.video)[^"\'\s<>\\ ]+', text.replace("\\/", "/"))
+        if match:
+            return match.group(0)
             
-            try:
-                async with async_playwright() as pw:
-                    # Use headed mode (xvfb provides display) — harder for CF to detect
-                    browser = await pw.chromium.launch(
-                        headless=False,
-                        args=chrome_args,
-                    )
-                    try:
-                        context = await browser.new_context(
-                            user_agent=self.base_headers["user-agent"],
-                            viewport={"width": 1366, "height": 768},
-                            locale="en-US",
-                        )
-                        
-                        # Stealth: remove webdriver flag
-                        await context.add_init_script("""
-                            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                            window.chrome = {runtime: {}};
-                            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                        """)
-                        
-                        page = await context.new_page()
-                        resp = await page.goto(link, wait_until="domcontentloaded", timeout=30000)
-                        
-                        status = resp.status if resp else 0
-                        logger.info(f"Playwright: response status {status} from IP {ip}")
-                        
-                        # If Cloudflare challenge/block, wait for possible JS redirect
-                        if status == 403:
-                            logger.info("Playwright: CF block, waiting for JS challenge resolution...")
-                            try:
-                                await page.wait_for_load_state("networkidle", timeout=10000)
-                                # Check if page changed after challenge
-                                new_content = await page.content()
-                                if "Access denied" in new_content:
-                                    logger.warning(f"Playwright: hard CF block on IP {ip}, trying next")
-                                    last_error = ExtractorError(f"Cloudflare blocked IP {ip}")
-                                    continue  # Try next IP
-                            except Exception:
-                                last_error = ExtractorError(f"Cloudflare blocked IP {ip}")
-                                continue
-                        
-                        # Log page URL and title for debug
-                        page_url = page.url
-                        page_title = await page.title()
-                        logger.info(f"Playwright: page loaded - URL: {page_url}, Title: {page_title}")
-                        
-                        # Strategy 1: Find specific continue/redirect link (NOT generic <a>)
-                        href = await page.evaluate("""() => {
-                            let a = document.querySelector('a[href*="maxstream"]')
-                                 || document.querySelector('a[href*="stayonline"]');
-                            if (a) return a.href;
-                            
-                            let btn = document.querySelector('a.button, a.btn, a[class*="continue"], a[class*="redirect"]');
-                            if (btn) return btn.href;
-                            
-                            let mainLinks = document.querySelectorAll('main a, .content a, #content a, .container a');
-                            for (let link of mainLinks) {
-                                let h = link.href;
-                                if (h && !h.includes('uprot.net') && (h.includes('maxstream') || h.includes('stayonline') || h.includes('/e/') || h.includes('/video/'))) {
-                                    return h;
-                                }
-                            }
-                            return null;
-                        }""")
-                        
-                        if href:
-                            logger.info(f"Playwright extracted uprot redirect: {href}")
-                            return href
-                        
-                        # Strategy 2: Click any visible button/link and follow redirect
-                        try:
-                            await page.click("a.button, a.btn, button.button, input[type='submit'], a[href*='maxstream'], a[href*='stayonline']", timeout=5000)
-                            await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                            new_url = page.url
-                            if new_url != page_url:
-                                logger.info(f"Playwright: clicked through to: {new_url}")
-                                return new_url
-                        except Exception as e:
-                            logger.debug(f"Playwright: click strategy failed: {e}")
-                        
-                        # Strategy 3: Check if already redirected
-                        current_url = page.url
-                        if "maxstream" in current_url or "stayonline" in current_url:
-                            logger.info(f"Playwright followed redirect to: {current_url}")
-                            return current_url
-                        
-                        # No redirect found on this IP
-                        content = await page.content()
-                        logger.warning(f"Playwright: no redirect found on IP {ip}. Content (500): {content[:500]}")
-                        last_error = ExtractorError("No redirect link found on uprot page")
-                    finally:
-                        await browser.close()
-            except Exception as e:
-                logger.warning(f"Playwright: IP {ip} failed: {e}")
-                last_error = e
-        
-        raise last_error or ExtractorError("All IPs exhausted for uprot.net")
-
-    async def _resolve_stayonline(self, stayonline_url: str) -> str:
-        """Resolve stayonline.pro wrapper to get final maxstream URL."""
-        try:
-            # Try AJAX endpoint first (stayonline uses /ajax/linkView)
-            from urllib.parse import urlparse
-            parsed = urlparse(stayonline_url)
-            path_parts = parsed.path.strip('/').split('/')
-            link_id = path_parts[-1] if path_parts else ''
+        # 2. Look for JavaScript-based redirects
+        js_match = re.search(r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']', text)
+        if js_match:
+            return js_match.group(1)
             
-            if link_id:
-                ajax_url = f"{parsed.scheme}://{parsed.netloc}/ajax/linkView"
-                headers = {
-                    **self.base_headers,
-                    "referer": stayonline_url,
-                    "x-requested-with": "XMLHttpRequest",
-                    "content-type": "application/x-www-form-urlencoded",
-                }
-                text = await self._smart_request(
-                    ajax_url, method="POST",
-                    headers=headers,
-                    data={"id": link_id}
-                )
-                # Response should contain the real URL
-                import json
-                try:
-                    data = json.loads(text)
-                    real_url = data.get("url") or data.get("link") or data.get("href")
-                    if real_url:
-                        logger.info(f"StayOnline resolved via AJAX: {real_url}")
-                        return real_url
-                except json.JSONDecodeError:
-                    pass
+        # 3. Look for Meta refresh
+        meta_match = re.search(r'content=["\']0;\s*url=([^"\']+)["\']', text, re.I)
+        if meta_match:
+            return meta_match.group(1)
+            
+        # 4. Use BeautifulSoup for interactive elements
+        soup = BeautifulSoup(text, "lxml")
+        
+        # Look for Bulma-style buttons or links with "Continue" text
+        for btn in soup.find_all(["a", "button"]):
+            text_content = btn.get_text().strip().lower()
+            if "continue" in text_content or "continua" in text_content or "vai al" in text_content:
+                href = btn.get("href")
+                if not href and btn.parent.name == "a":
+                    href = btn.parent.get("href")
                 
-                # Maybe direct URL in response
-                url_match = re.search(r'https?://[^"\s<>]+maxstream[^"\s<>]+', text)
-                if url_match:
-                    logger.info(f"StayOnline resolved via regex: {url_match.group(0)}")
-                    return url_match.group(0)
-        except Exception as e:
-            logger.warning(f"StayOnline AJAX resolution failed: {e}")
+                if href and "uprot" not in href:
+                    return href
         
-        # Fallback: load page and scrape
-        text = await self._smart_request(stayonline_url)
-        url_match = re.search(r'https?://[^"\s<>]*maxstream[^"\s<>]*', text)
-        if url_match:
-            return url_match.group(0)
+        # Specific Bulma selectors
+        for selector in ['a[href*="maxstream"]', 'a[href*="stayonline"]', '.button.is-info', '.button.is-success', 'a.button']:
+            tag = soup.select_one(selector)
+            if tag and tag.get("href") and "uprot" not in tag["href"]:
+                return tag["href"]
         
-        raise ExtractorError(f"Could not resolve stayonline URL: {stayonline_url}")
+        # If it's a form
+        form = soup.find("form")
+        if form and form.get("action") and "uprot" not in form["action"]:
+            return form["action"]
+            
+        # If we see "Cloudflare" or "Challenge" in text, it's a block
+        if "cf-challenge" in text or "ray id" in text.lower() or "checking your browser" in text.lower():
+            raise ExtractorError("Cloudflare block (Browser check/Challenge)")
+            
+        logger.error(f"Uprot Parse Failure. Content: {text[:2000]}...")
+        raise ExtractorError("Redirect link not found in uprot page")
 
     async def get_uprot(self, link: str):
         """Extract MaxStream URL from uprot redirect."""
-        if "msf" in link:
-            link = link.replace("msf", "mse")
+        # Fix link type
+        link = link.replace("msf", "mse")
         
-        # Try Playwright first (bypasses Cloudflare TLS fingerprinting)
-        try:
-            return await self._get_uprot_playwright(link)
-        except ImportError:
-            logger.warning("Playwright not installed, skipping browser-based uprot bypass")
-        except Exception as e:
-            logger.warning(f"Playwright uprot failed ({e}), falling back to aiohttp")
-        
-        # Fallback: aiohttp with DoH
+        # Direct request (user should provide non-datacenter proxy in GLOBAL_PROXY)
         text = await self._smart_request(link)
-        
-        soup = BeautifulSoup(text, "lxml")
-        a_tag = soup.find("a")
-        if not a_tag:
-            # Fallback: maybe the link is in a script or button
-            button = soup.find("button", class_="button is-info")
-            if button and button.parent.name == "a":
-                maxstream_url = button.parent.get("href")
-            else:
-                logger.error(f"Could not find 'Continue' link in uprot page: {text[:500]}...")
-                raise ExtractorError("Failed to find redirect link on uprot.net")
-        else:
-            maxstream_url = a_tag.get("href")
-            
-        return maxstream_url
+        return self._parse_uprot_html(text)
 
     async def extract(self, url: str, **kwargs) -> dict:
         """Extract Maxstream URL."""
         maxstream_url = await self.get_uprot(url)
-        logger.info(f"Uprot resolved to: {maxstream_url}")
+        logger.info(f"Target URL: {maxstream_url}")
         
-        # Handle stayonline.pro intermediate wrapper
-        if "stayonline" in maxstream_url:
-            maxstream_url = await self._resolve_stayonline(maxstream_url)
-            logger.info(f"StayOnline resolved to: {maxstream_url}")
+        # Use strict headers to avoid Error 131
+        headers = {
+            **self.base_headers,
+            "referer": "https://uprot.net/",
+            "accept-language": "en-US,en;q=0.5"
+        }
         
-        text = await self._smart_request(maxstream_url, headers={"accept-language": "en-US,en;q=0.5"})
-
-        # Try direct extraction first
+        text = await self._smart_request(maxstream_url, headers=headers)
+        
+        # Direct sources check
         direct_match = re.search(r'sources:\s*\[\{src:\s*"([^"]+)"', text)
         if direct_match:
-            final_url = direct_match.group(1)
-            logger.info(f"Successfully extracted direct MaxStream URL: {final_url}")
-            self.base_headers["referer"] = url
             return {
-                "destination_url": final_url,
-                "request_headers": self.base_headers,
+                "destination_url": direct_match.group(1),
+                "request_headers": {**self.base_headers, "referer": maxstream_url},
                 "mediaflow_endpoint": self.mediaflow_endpoint,
             }
+
+        # Fallback to packer logic
+        match = re.search(r"\}\('(.+)',.+,'(.+)'\.split", text)
+        if not match:
+             match = re.search(r"eval\(function\(p,a,c,k,e,d\).+?\}\('(.+?)',.+?,'(.+?)'\.split", text, re.S)
+        
+        if not match:
+            raise ExtractorError(f"Failed to extract from: {text[:200]}")
+
+        # ... rest of packer logic (terms.index, etc) ...})
+        # ... rest of regex logic ...
 
         # Fallback to packer logic
         match = re.search(r"\}\('(.+)',.+,'(.+)'\.split", text)
